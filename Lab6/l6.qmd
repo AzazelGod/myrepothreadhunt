@@ -1,0 +1,169 @@
+---
+title: "Практическая работа 006"
+author: "trembochev@yandex.ru"
+format: 
+  md:
+    output-file: README.md
+---
+
+## Цель работы
+
+1. Закрепить навыки исследования данных журнала Windows Active Directory
+2. Изучить структуру журнала системы Windows Active Directory
+3. Зекрепить практические навыки использования языка программирования R для обработки данных
+4. Закрепить знания основных функций обработки данных экосистемы tidyverse языка R
+
+## Исходные данные
+
+1. Программное обеспечение Windows 11
+2. Rstudio Desktop
+3. Интерпретатор языка R 4.5.2
+4. Выгрузки данных журнала Windows Active Directory
+
+## Задание
+
+Используя программный пакет dplyr, освоить анализ DNS логов с помощью языка программирования R.
+
+## Ход работы
+
+1. Подготовка данных \
+    1.1. Импортировать данные (https://storage.yandexcloud.net/iamcth-data/dataset.tar.gz) \
+    1.2. Привести датасеты в вид “аккуратных данных”, преобразовать типы столбцов в соответствии с типом данных \
+    1.3. Просмотрите общую структуру данных с помощью функции glimpse() \
+
+
+2. Анализ \
+    2.1. Раскройте датафрейм избавившись от вложенных датафреймов. Для обнаружения таких можно использовать функцию dplyr::glimpse() , а для раскрытия вложенности – tidyr::unnest() . Обратите внимание, что при раскрытии теряются внешние названия колонок – это можно предотвратить если использовать параметр tidyr::unnest(..., names_sep = ) \
+    2.2. Минимизируйте количество колонок в датафрейме – уберите колоки с единственным значением параметра. \
+    2.3. Какое количество хостов представлено в данном датасете? \
+    2.4. Подготовьте датафрейм с расшифровкой Windows Event_ID, приведите типы данных к типу их значений.\
+    2.5. Есть ли в логе события с высоким и средним уровнем значимости? Сколько их?
+    
+3. Оформить отчет в соответствии с шаблоном\
+
+### Шаг 1. 
+
+#### Импортировать данные
+Установим:
+
+```
+> download.file("https://storage.yandexcloud.net/iamcth-data/dataset.tar.gz", "dataset.tar.gz")
+пробую URL 'https://storage.yandexcloud.net/iamcth-data/dataset.tar.gz'
+Content type 'application/gzip' length 12608123 bytes (12.0 MB)
+downloaded 12.0 MB
+
+> untar("dataset.tar.gz")
+```
+
+Для начала импортируем необходимые пакеты:
+
+```{r}
+library(jsonlite)
+library(tidyverse)
+```
+Cделаем датафрейм:
+
+```{r}
+json_path <- file.path("caldera_attack_evals_round1_day1_2019-10-20201108.json")
+
+events_data <- stream_in(file(json_path, open = "r"), verbose = FALSE)
+
+glimpse(events_data)
+```
+Cкачаем справочник о условным кодам журнала Windows это будет event_df.
+```{r}
+library(xml2)
+library(rvest)
+webpage_url <- "https://learn.microsoft.com/en-us/windows-server/identity/ad-ds/plan/appendix-l--events-to-monitor"
+webpage <- xml2::read_html(webpage_url)
+event_df <- rvest::html_table(webpage)[[1]]
+```
+
+```{r}
+glimpse(event_df)
+
+```
+
+
+### Шаг 2. Анализ
+
+####  Раскройте датафрейм избавившись от вложенных датафреймов. Для обнаружения таких можно использовать функцию dplyr::glimpse() , а для раскрытия вложенности – tidyr::unnest() . Обратите внимание, что при раскрытии теряются внешние названия колонок – это можно предотвратить если использовать параметр tidyr::unnest(..., names_sep = ).
+
+
+Распакуем все вложенные датафреймы в исходном датафрейме
+```{r}
+library(tidyr)
+library(dplyr)
+
+events_flat <- events_data %>%
+  unnest(c(`@metadata`, event, log, winlog, ecs, host, agent), names_sep = "_")
+
+glimpse(events_flat)
+ncol(events_flat)
+```
+
+#### 2. Минимизируйте количество колонок в датафрейме – уберите колоки с единственным значением параметра.
+
+```{r}
+events_clean <- events_flat %>%
+  select(where(~n_distinct(.) > 1))
+glimpse(events_clean)
+ncol(events_clean)
+```
+
+#### 3. Какое количество хостов представлено в данном датасете?
+
+```{r}
+events_clean %>% select(winlog_computer_name) %>% distinct() %>% count()
+```
+
+#### 4. Подготовьте датафрейм с расшифровкой Windows Event_ID, приведите типы данных к типу их значений
+
+Подготовим справочник и соеденим его с нашем логом (датафреймов).Добавили к каждому событию из лога информацию об его важности.
+
+```{r}
+event_dict <- event_df %>%
+  rename(
+    Event_ID = `Current Windows Event ID`,
+    Legacy_ID = `Legacy Windows Event ID`,
+    Criticality = `Potential Criticality`,
+    Summary = `Event Summary`
+  ) %>%
+
+  mutate(
+    Event_ID = as.integer(Event_ID),
+    Criticality = factor(Criticality)
+  )
+
+events_final <- events_clean %>%
+  left_join(event_dict, by = c("winlog_event_id" = "Event_ID"))
+
+glimpse(events_final)
+
+```
+
+#### 5. Есть ли в логе события с высоким и средним уровнем значимости? Сколько их?
+
+Считаем, сколько событий каждого уровня важности есть в логе. 
+
+
+```{r}
+summary_counts <- events_final %>%
+  filter(!is.na(Criticality)) %>% group_by(Criticality) %>%summarise(count = n()) %>% arrange(desc(count))
+
+print(summary_counts)
+```
+
+Как оказалось событий с критичностью Medium/High в наших событиях нет, есть только события с критичностью Low
+
+### Шаг 3
+
+Отчёт написан и оформлен
+
+## Оценка результатов
+
+Задача решена с использованием языка программирования R и пакетами `dplyr`, `jsonlite`, `tidyverse`.Я научился использовать эти инструмента для данных журнала Windows Active Directory.
+
+## Вывод
+
+В данной работе я используя программный пакет dplyr, освоить анализ данных журнала Windows Active Directory с помощью языка программирования R.
