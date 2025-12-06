@@ -1,0 +1,356 @@
+---
+title: "Практическая работа 005"
+author: "trembochev@yandex.ru"
+format: 
+  md:
+    output-file: README.md
+---
+
+## Цель работы
+
+1. Получить знания о методах исследования радиоэлектронной обстановки.
+2. Составить представление о механизмах работы Wi-Fi сетей на канальном и сетевом уровне модели OSI.
+3. Зекрепить практические навыки использования языка программирования R для обработки данных
+4. Закрепить знания основных функций обработки данных экосистемы tidyverse языка R
+
+## Исходные данные
+
+1. Программное обеспечение Windows 11
+2. Rstudio Desktop
+3. Интерпретатор языка R 4.5.2
+4. Данные wi-fi снифера
+
+## Задание
+
+Используя программный пакет dplyr, освоить анализ DNS логов с помощью языка программирования R.
+
+## Ход работы
+
+1. Подготовка данных \
+    1.1. Импортировать данные (https://storage.yandexcloud.net/dataset.ctfsec/P2_wi_data.csv)\
+    1.2. Привести датасеты в вид “аккуратных данных”, преобразовать типы столбцов в соответствии с типом\ данных
+    1.3. Просмотрите общую структуру данных с помощью функции `glimpse()`\
+2. Анализ\
+    2.1 Анализ точек доступа\
+        2.1.1 Определить небезопасные точки доступа (без шифрования – OPN)\
+        2.1.2. Определить производителя для каждого обнаруженного устройства\
+        2.1.3. Выявить устройства, использующие последнюю версию протокола шифрования WPA3, и названия точек доступа, реализованных на этих устройствах\
+        2.1.4. Отсортировать точки доступа по интервалу времени, в течение которого они находились на связи, по убыванию.\
+        2.1.5. Обнаружить топ-10 самых быстрых точек доступа.\
+        2.1.6. Отсортировать точки доступа по частоте отправки запросов (beacons) в единицу времени по их убыванию.\
+    2.2 Анализ клиентов\
+        2.2.1 Определить производителя для каждого обнаруженного устройства.\
+        2.2.2 Обнаружить устройства, которые НЕ рандомизируют свой MAC адрес\
+        2.2.3. Кластеризовать запросы от устройств к точкам доступа по их именам. Определить время появления устройства в зоне радиовидимости и время выхода его из нее.\
+        2.2.4. Оценить стабильность уровня сигнала внури кластера во времени. Выявить наиболее стабильный кластер.\
+3.  Оформить отчет в соответствии с шаблоном \
+
+
+### Шаг 1.
+
+Для начала импортируем необходимые пакеты:
+
+```{r}
+library(tidyverse)
+```
+Скачаем файл:
+
+```{r}
+tmp <- tempfile()
+download.file(
+  "https://storage.yandexcloud.net/dataset.ctfsec/P2_wifi_data.csv",
+  tmp,
+  mode = "wb"
+)
+
+wifi_ap <- read_csv(tmp, n_max = 167)
+
+clients <- read_csv(tmp, skip = 169)
+
+```
+
+Приведем аттрибуты к нужному типу данных для датасета точек доступа:
+``` {r}
+names(wifi_ap) <- trimws(names(wifi_ap))
+
+wifi_ap_clean <- wifi_ap %>%
+  rename(
+    bssid      = BSSID,
+    first_seen = `First time seen`,
+    last_seen  = `Last time seen`,
+    speed      = Speed,
+    privacy    = Privacy,
+    cipher     = Cipher,
+    auth       = Authentication,
+    power      = Power,
+    beacons    = `# beacons`,
+    iv_count   = `# IV`,
+    lan_ip     = `LAN IP`,
+    id_length  = `ID-length`,
+    essid      = ESSID
+  ) %>%
+  mutate(
+    across(where(is.character), trimws),
+    first_seen = as.POSIXct(first_seen),
+    last_seen  = as.POSIXct(last_seen),
+    across(c(channel, speed, power, beacons, iv_count, id_length), as.numeric)
+  )
+
+```
+
+Проделаем операцию с клиентами:
+
+```{r}
+names(clients) <- trimws(names(clients))
+
+wifi_clients_clean <- clients %>%
+  rename(
+    station_mac = `Station MAC`,
+    first_seen  = `First time seen`,
+    last_seen   = `Last time seen`,
+    power       = Power,
+    packets     = `# packets`,
+    bssid       = BSSID,
+    probed_essids = `Probed ESSIDs`
+  ) %>%
+  mutate(
+    across(where(is.character), trimws),
+    first_seen = as.POSIXct(first_seen),
+    last_seen  = as.POSIXct(last_seen),
+    power      = as.numeric(power),
+    packets    = as.numeric(packets),
+    station_mac = toupper(station_mac),
+    bssid = case_when(
+      grepl("(?i)not associated", bssid) ~ NA_character_,
+      TRUE ~ toupper(bssid)
+    )
+  )
+
+```
+
+Теперь посмотрим общую структуру файлов:
+
+```{r}
+glimpse(wifi_ap_clean)
+glimpse(wifi_clients_clean)
+
+```
+
+### Шаг 2. 
+
+#### 1. Определить небезопасные точки доступа (без шифрования – OPN)
+
+```{r}
+wifi_ap_clean %>% filter(privacy == "OPN")
+```
+
+### 2. Определить производителя для каждого обнаруженного устройства
+
+
+```{r}
+
+oui_url <- "https://standards-oui.ieee.org/oui/oui.txt"
+oui_text <- httr::content(httr::GET(oui_url), "text", encoding = "UTF-8")
+
+oui_lines <- strsplit(oui_text, "\n")[[1]]
+oui_db <- data.frame(
+  oui = substr(grep("^[0-9A-F]{6}", oui_lines, value = TRUE), 1, 8),
+  vendor = substr(grep("^[0-9A-F]{6}", oui_lines, value = TRUE), 22, 100)
+)
+
+oui_db$oui <- paste0(
+  substr(oui_db$oui, 1, 2), ":",
+  substr(oui_db$oui, 3, 4), ":",
+  substr(oui_db$oui, 5, 6)
+)
+
+
+wifi_ap_clean$oui <- toupper(substr(wifi_ap_clean$bssid, 1, 8))
+wifi_ap_clean$vendor <- oui_db$vendor[match(wifi_ap_clean$oui, oui_db$oui)]
+
+result <- wifi_ap_clean %>%
+  filter(!is.na(vendor)) %>%
+  select(bssid, vendor) %>%
+  as.data.frame()
+
+print(result)
+```
+
+
+
+#### 3. Выявить устройства, использующие последнюю версию протокола шифрования WPA3, и названия точек доступа, реализованных на этих устройствах?
+
+
+```{r}
+wpa3_aps <- wifi_ap_clean %>%
+  filter(grepl("WPA3", privacy, ignore.case = TRUE) | grepl("SAE", auth, ignore.case = TRUE)) %>%
+  select(bssid, essid, auth)
+
+wpa3_aps
+```
+
+#### 4. Отсортировать точки доступа по интервалу времени, в течение которого они находились на связи, по убыванию
+
+
+```{r}
+
+wifi_ap_clean <- wifi_ap_clean %>%
+  mutate(duration_sec = as.numeric(difftime(last_seen, first_seen, units = "secs")))
+
+
+sorted_ap <- wifi_ap_clean %>%
+  arrange(desc(duration_sec))
+
+
+result <- sorted_ap %>%
+  mutate(duration = paste(
+    floor(duration_sec/3600), "h",
+    floor((duration_sec %% 3600)/60), "m",
+    round(duration_sec %% 60), "s"
+  )) %>%
+  select(bssid, essid, first_seen, last_seen, duration)
+
+print(result)
+```
+
+
+#### 5. Обнаружить топ-10 самых быстрых точек доступа
+
+```{r}
+top_fastest <- wifi_ap_clean %>%
+  arrange(desc(speed)) %>%
+  head(10) %>%
+  select(bssid, essid, speed, channel, power)
+
+print(top_fastest)
+
+```
+
+#### 6. Отсортировать точки доступа по частоте отправки запросов (beacons) в единицу времени по их убыванию.
+
+```{r}
+sorted_rate <- wifi_ap_clean %>%
+  mutate(
+    duration_sec = as.numeric(difftime(last_seen, first_seen, units = "secs")),
+    beacon_rate = ifelse(duration_sec > 0, beacons / duration_sec, 0)
+  ) %>%
+  arrange(desc(beacon_rate)) %>%
+  select(bssid, essid, beacons, duration_sec, beacon_rate, first_seen, last_seen)
+
+print(sorted_rate)
+```
+
+#### 1. Определить производителя для каждого обнаруженного устройства
+
+
+```{r}
+
+
+
+wifi_clients_clean$oui <- toupper(substr(wifi_clients_clean$station_mac, 1, 8))
+wifi_clients_clean$vendor <- oui_db$vendor[match(wifi_clients_clean$oui, oui_db$oui)]
+
+result2 <- wifi_clients_clean %>%
+  filter(!is.na(vendor)) %>%
+  select(station_mac, vendor) %>%
+  as.data.frame()
+
+print(result2)
+```
+
+#### 2. Обнаружить устройства, которые НЕ рандомизируют свой MAC адрес
+Нерандомизированный MAC — это глобально назначенный адрес (бит LAA = 0). Проверяем 2 бита первого октета:
+
+
+```{r}
+is_laa <- function(mac) {
+  mac_hex <- toupper(gsub("[^0-9A-F]", "", mac))
+  if (nchar(mac_hex) < 2) return(NA)
+  
+  b1 <- strtoi(substr(mac_hex, 1, 2), base = 16)
+  if (is.na(b1)) return(NA)
+  
+  if (bitwAnd(b1, 0x01) != 0) return(NA)
+  
+  laa <- bitwAnd(b1, 0x02) != 0
+  return(laa)
+}
+
+clients_nr <- wifi_clients_clean %>%
+  mutate(is_randomized = vapply(station_mac, is_laa, logical(1))) %>%
+  filter(is_randomized == FALSE) %>%
+  select(station_mac, bssid, first_seen, last_seen, power, packets)
+
+clients_nr
+```
+
+#### Кластеризовать запросы от устройств к точкам доступа по их именам. Определить время появления устройства в зоне радиовидимости и время выхода его из нее
+
+
+```{r}
+
+ap_essid <- wifi_ap_clean %>%
+  transmute(bssid, essid_norm = na_if(str_squish(essid), ""))
+
+device_essid_presence <- wifi_clients_clean %>%
+  inner_join(ap_essid, by = "bssid") %>%  
+  group_by(station_mac, essid_norm) %>% 
+  summarise(
+    first_seen   = min(first_seen),
+    last_seen    = max(last_seen),
+    duration_sec = as.numeric(last_seen - first_seen, units = "secs"),
+    n_records    = n(),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(duration_sec), station_mac)
+
+device_essid_presence
+
+```
+
+####  Оценить стабильность уровня сигнала внури кластера во времени. Выявить наиболее стабильный кластер.
+
+
+
+```{r}
+client_clusters <- wifi_clients_clean %>%
+  filter(!is.na(bssid)) %>%
+  left_join(
+    ap_essid,
+    by = "bssid"
+  ) %>%
+  filter(!is.na(essid_norm), essid_norm != "") %>%
+  group_by(station_mac, essid_norm)
+stability <- client_clusters %>%
+  summarise(
+    n_obs = n(),
+    span_m = as.numeric(difftime(max(last_seen), min(first_seen), units = "mins")),
+    sd_rssi   = sd(power,   na.rm = TRUE),
+    .groups   = "drop"
+  ) %>%
+  arrange(sd_rssi)
+
+most_stable <- slice_head(stability, n = 1)
+
+stability
+
+```
+
+```{r}
+most_stable
+```
+
+### Шаг 3
+
+Отчёт написан и оформлен
+
+
+## Оценка результатов
+
+Задача решена с использованием языка программирования R и пакетами `tidyverse`. Я научился использовать эти инструмента для анализа 
+данных полученных с wi-fi снифера.
+
+## Вывод
+
+В данной работе я используя программный пакет dplyr, освоить анализ данных полученных с wi-fi снифера, с помощью языка программирования R.
+
